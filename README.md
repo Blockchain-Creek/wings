@@ -3,6 +3,7 @@
 ![Discord](https://img.shields.io/discord/122900397965705216?label=Discord&logo=Discord&logoColor=white)
 ![GitHub Releases](https://img.shields.io/github/downloads/pterodactyl/wings/latest/total)
 [![Go Report Card](https://goreportcard.com/badge/github.com/pterodactyl/wings)](https://goreportcard.com/report/github.com/pterodactyl/wings)
+[![Build Status](https://teamcity.buildserver.be/app/rest/builds/buildType:Wings_Build/statusIcon)](https://teamcity.buildserver.be/project/Wings?mode=builds)
 
 # Pterodactyl Wings
 Wings is Pterodactyl's server control plane, built for the rapidly changing gaming industry and designed to be
