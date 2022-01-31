@@ -4,7 +4,6 @@ import (
 	"context"
 	"fmt"
 	"os"
-	"sync"
 	"time"
 
 	"emperror.dev/errors"
@@ -39,81 +38,6 @@ func (pa PowerAction) IsValid() bool {
 
 func (pa PowerAction) IsStart() bool {
 	return pa == PowerActionStart || pa == PowerActionRestart
-}
-
-type powerLocker struct {
-	mu sync.RWMutex
-	ch chan bool
-}
-
-func newPowerLocker() *powerLocker {
-	return &powerLocker{
-		ch: make(chan bool, 1),
-	}
-}
-
-type errPowerLockerLocked struct{}
-
-func (e errPowerLockerLocked) Error() string {
-	return "cannot acquire a lock on the power state: already locked"
-}
-
-var ErrPowerLockerLocked error = errPowerLockerLocked{}
-
-// IsLocked returns the current state of the locker channel. If there is
-// currently a value in the channel, it is assumed to be locked.
-func (pl *powerLocker) IsLocked() bool {
-	pl.mu.RLock()
-	defer pl.mu.RUnlock()
-	return len(pl.ch) == 1
-}
-
-// Acquire will acquire the power lock if it is not currently locked. If it is
-// already locked, acquire will fail to acquire the lock, and will return false.
-func (pl *powerLocker) Acquire() error {
-	pl.mu.Lock()
-	defer pl.mu.Unlock()
-	if len(pl.ch) == 1 {
-		return errors.WithStack(ErrPowerLockerLocked)
-	}
-	pl.ch <- true
-	return nil
-}
-
-// TryAcquire will attempt to acquire a power-lock until the context provided
-// is canceled.
-func (pl *powerLocker) TryAcquire(ctx context.Context) error {
-	select {
-	case pl.ch <- true:
-		return nil
-	case <-ctx.Done():
-		if err := ctx.Err(); err != nil {
-			return errors.WithStack(err)
-		}
-		return nil
-	}
-}
-
-// Release will drain the locker channel so that we can properly re-acquire it
-// at a later time.
-func (pl *powerLocker) Release() {
-	pl.mu.Lock()
-	if len(pl.ch) == 1 {
-		<-pl.ch
-	}
-	pl.mu.Unlock()
-}
-
-// Destroy cleans up the power locker by closing the channel.
-func (pl *powerLocker) Destroy() {
-	pl.mu.Lock()
-	if pl.ch != nil {
-		if len(pl.ch) == 1 {
-			<-pl.ch
-		}
-		close(pl.ch)
-	}
-	pl.mu.Unlock()
 }
 
 // ExecutingPowerAction checks if there is currently a power action being

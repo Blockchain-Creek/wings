@@ -1,13 +1,13 @@
 package server
 
 import (
+	"bytes"
 	"regexp"
 	"strconv"
 	"sync"
 
 	"github.com/apex/log"
 
-	"github.com/pterodactyl/wings/config"
 	"github.com/pterodactyl/wings/environment"
 	"github.com/pterodactyl/wings/events"
 	"github.com/pterodactyl/wings/remote"
@@ -50,48 +50,34 @@ func (dsl *diskSpaceLimiter) Trigger() {
 	})
 }
 
+// processConsoleOutputEvent handles output from a server's Docker container
+// and runs through different limiting logic to ensure that spam console output
+// does not cause negative effects to the system. This will also monitor the
+// output lines to determine if the server is started yet, and if the output is
+// not being throttled, will send the data over to the websocket.
 func (s *Server) processConsoleOutputEvent(v []byte) {
-	t := s.Throttler()
-	err := t.Increment(func() {
-		s.PublishConsoleOutputFromDaemon("Your server is outputting too much data and is being throttled.")
-	})
-	// An error is only returned if the server has breached the thresholds set.
-	if err != nil {
-		// If the process is already stopping, just let it continue with that action rather than attempting
-		// to terminate again.
-		if s.Environment.State() != environment.ProcessStoppingState {
-			s.Environment.SetState(environment.ProcessStoppingState)
+	// Always process the console output, but do this in a seperate thread since we
+	// don't really care about side-effects from this call, and don't want it to block
+	// the console sending logic.
+	go s.onConsoleOutput(v)
 
-			go func() {
-				s.Log().Warn("stopping server instance, violating throttle limits")
-				s.PublishConsoleOutputFromDaemon("Your server is being stopped for outputting too much data in a short period of time.")
-
-				// Completely skip over server power actions and terminate the running instance. This gives the
-				// server 15 seconds to finish stopping gracefully before it is forcefully terminated.
-				if err := s.Environment.WaitForStop(config.Get().Throttles.StopGracePeriod, true); err != nil {
-					// If there is an error set the process back to running so that this throttler is called
-					// again and hopefully kills the server.
-					if s.Environment.State() != environment.ProcessOfflineState {
-						s.Environment.SetState(environment.ProcessRunningState)
-					}
-
-					s.Log().WithField("error", err).Error("failed to terminate environment after triggering throttle")
-				}
-			}()
-		}
+	// If the console is being throttled, do nothing else with it, we don't want
+	// to waste time. This code previously terminated server instances after violating
+	// different throttle limits. That code was clunky and difficult to reason about,
+	// in addition to being a consistent pain point for users.
+	//
+	// In the interest of building highly efficient software, that code has been removed
+	// here, and we'll rely on the host to detect bad actors through their own means.
+	if !s.Throttler().Allow() {
+		return
 	}
 
-	// If we are not throttled, go ahead and output the data.
-	if !t.Throttled() {
-		s.Sink(LogSink).Push(v)
-	}
-
-	// Also pass the data along to the console output channel.
-	s.onConsoleOutput(string(v))
+	s.Sink(LogSink).Push(v)
 }
 
-// StartEventListeners adds all the internal event listeners we want to use for a server. These listeners can only be
-// removed by deleting the server as they should last for the duration of the process' lifetime.
+// StartEventListeners adds all the internal event listeners we want to use for
+// a server. These listeners can only be removed by deleting the server as they
+// should last for the duration of the process' lifetime.
 func (s *Server) StartEventListeners() {
 	state := make(chan events.Event)
 	stats := make(chan events.Event)
@@ -114,13 +100,10 @@ func (s *Server) StartEventListeners() {
 				}()
 			case e := <-stats:
 				go func() {
-					// Update the server resource tracking object with the resources we got here.
-					s.resources.mu.Lock()
-					s.resources.Stats = e.Data.(environment.Stats)
-					s.resources.mu.Unlock()
+					s.resources.UpdateStats(e.Data.(environment.Stats))
 
-					// If there is no disk space available at this point, trigger the server disk limiter logic
-					// which will start to stop the running instance.
+					// If there is no disk space available at this point, trigger the server
+					// disk limiter logic which will start to stop the running instance.
 					if !s.Filesystem().HasSpaceAvailable(true) {
 						l.Trigger()
 					}
@@ -134,8 +117,10 @@ func (s *Server) StartEventListeners() {
 						s.Events().Publish(InstallOutputEvent, e.Data)
 					case environment.DockerImagePullStarted:
 						s.PublishConsoleOutputFromDaemon("Pulling Docker container image, this could take a few minutes to complete...")
-					default:
+					case environment.DockerImagePullCompleted:
 						s.PublishConsoleOutputFromDaemon("Finished pulling Docker container image")
+					default:
+						s.Log().WithField("topic", e.Topic).Error("unhandled docker event topic")
 					}
 				}()
 			}
@@ -153,27 +138,34 @@ var stripAnsiRegex = regexp.MustCompile("[\u001B\u009B][[\\]()#;?]*(?:(?:(?:[a-z
 
 // Custom listener for console output events that will check if the given line
 // of output matches one that should mark the server as started or not.
-func (s *Server) onConsoleOutput(data string) {
-	// Get the server's process configuration.
+func (s *Server) onConsoleOutput(data []byte) {
+	if s.Environment.State() != environment.ProcessStartingState && !s.IsRunning() {
+		return
+	}
+
 	processConfiguration := s.ProcessConfiguration()
+
+	// Make a copy of the data provided since it is by reference, otherwise you'll
+	// potentially introduce a race condition by modifying the value.
+	v := make([]byte, len(data))
+	copy(v, data)
 
 	// Check if the server is currently starting.
 	if s.Environment.State() == environment.ProcessStartingState {
 		// Check if we should strip ansi color codes.
 		if processConfiguration.Startup.StripAnsi {
-			// Strip ansi color codes from the data string.
-			data = stripAnsiRegex.ReplaceAllString(data, "")
+			v = stripAnsiRegex.ReplaceAll(v, []byte(""))
 		}
 
 		// Iterate over all the done lines.
 		for _, l := range processConfiguration.Startup.Done {
-			if !l.Matches(data) {
+			if !l.Matches(v) {
 				continue
 			}
 
 			s.Log().WithFields(log.Fields{
 				"match":   l.String(),
-				"against": strconv.QuoteToASCII(data),
+				"against": strconv.QuoteToASCII(string(v)),
 			}).Debug("detected server in running state based on console line output")
 
 			// If the specific line of output is one that would mark the server as started,
@@ -190,7 +182,7 @@ func (s *Server) onConsoleOutput(data string) {
 	if s.IsRunning() {
 		stop := processConfiguration.Stop
 
-		if stop.Type == remote.ProcessStopCommand && data == stop.Value {
+		if stop.Type == remote.ProcessStopCommand && bytes.Equal(v, []byte(stop.Value)) {
 			s.Environment.SetState(environment.ProcessOfflineState)
 		}
 	}
