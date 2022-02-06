@@ -133,11 +133,11 @@ func (s *Server) HandlePowerAction(action PowerAction, waitSeconds ...int) error
 
 		return s.Environment.Start(s.Context())
 	case PowerActionStop:
-		// We're specifically waiting for the process to be stopped here, otherwise the lock is released
-		// too soon, and you can rack up all sorts of issues.
-		return s.Environment.WaitForStop(10*60, true)
+		fallthrough
 	case PowerActionRestart:
-		if err := s.Environment.WaitForStop(10*60, true); err != nil {
+		// We're specifically waiting for the process to be stopped here, otherwise the lock is
+		// released too soon, and you can rack up all sorts of issues.
+		if err := s.Environment.WaitForStop(s.Context(), time.Minute*10, true); err != nil {
 			// Even timeout errors should be bubbled back up the stack. If the process didn't stop
 			// nicely, but the terminate argument was passed then the server is stopped without an
 			// error being returned.
@@ -149,6 +149,10 @@ func (s *Server) HandlePowerAction(action PowerAction, waitSeconds ...int) error
 			return err
 		}
 
+		if action == PowerActionStop {
+			return nil
+		}
+
 		// Now actually try to start the process by executing the normal pre-boot logic.
 		if err := s.onBeforeStart(); err != nil {
 			return err
@@ -156,7 +160,7 @@ func (s *Server) HandlePowerAction(action PowerAction, waitSeconds ...int) error
 
 		return s.Environment.Start(s.Context())
 	case PowerActionTerminate:
-		return s.Environment.Terminate(os.Kill)
+		return s.Environment.Terminate(s.Context(), os.Kill)
 	}
 
 	return errors.New("attempting to handle unknown power action")
@@ -197,15 +201,19 @@ func (s *Server) onBeforeStart() error {
 	// we don't need to actively do anything about it at this point, worse comes to worst the
 	// server starts in a weird state and the user can manually adjust.
 	s.PublishConsoleOutputFromDaemon("Updating process configuration files...")
+	s.Log().Debug("updating server configuration files...")
 	s.UpdateConfigurationFiles()
+	s.Log().Debug("updated server configuration files")
 
 	if config.Get().System.CheckPermissionsOnBoot {
 		s.PublishConsoleOutputFromDaemon("Ensuring file permissions are set correctly, this could take a few seconds...")
 		// Ensure all the server file permissions are set correctly before booting the process.
+		s.Log().Debug("chowning server root directory...")
 		if err := s.Filesystem().Chown("/"); err != nil {
 			return errors.WithMessage(err, "failed to chown root server directory during pre-boot process")
 		}
 	}
 
+	s.Log().Info("completed server preflight, starting boot process...")
 	return nil
 }
